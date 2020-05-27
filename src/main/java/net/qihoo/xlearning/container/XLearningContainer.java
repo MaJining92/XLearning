@@ -3,9 +3,15 @@ package net.qihoo.xlearning.container;
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
 import com.google.gson.Gson;
 import com.google.gson.reflect.TypeToken;
+import net.qihoo.xlearning.AM.ApplicationMaster;
 import net.qihoo.xlearning.api.ApplicationContainerProtocol;
 import net.qihoo.xlearning.api.XLearningConstants;
 import net.qihoo.xlearning.common.*;
+import net.qihoo.xlearning.common.InputInfo;
+import net.qihoo.xlearning.common.OutputInfo;
+import net.qihoo.xlearning.common.SecurityUtil;
+import net.qihoo.xlearning.common.XLearningContainerStatus;
+import net.qihoo.xlearning.common.TextMultiOutputFormat;
 import net.qihoo.xlearning.conf.XLearningConfiguration;
 import net.qihoo.xlearning.util.Utilities;
 import org.apache.commons.lang.StringUtils;
@@ -17,7 +23,9 @@ import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.io.IOUtils;
 import org.apache.hadoop.ipc.RPC;
+import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.yarn.api.ApplicationConstants;
+import org.apache.hadoop.yarn.conf.YarnConfiguration;
 import org.apache.hadoop.yarn.util.ConverterUtils;
 import org.apache.hadoop.io.Text;
 import org.apache.hadoop.mapred.*;
@@ -32,6 +40,7 @@ import java.net.Socket;
 import java.net.UnknownHostException;
 import java.nio.file.Files;
 import java.nio.file.Paths;
+import java.security.PrivilegedExceptionAction;
 import java.util.*;
 import java.util.concurrent.*;
 import java.text.SimpleDateFormat;
@@ -159,46 +168,6 @@ public class XLearningContainer {
       LOG.info("XFlow index is:" + this.index);
     }
 
-    if (xlearningAppType.equals("MPI")) {
-      if (this.envs.containsKey(XLearningConstants.Environment.MPI_EXEC_DIR.toString())) {
-        this.mpiAppDir = envs.get(XLearningConstants.Environment.MPI_EXEC_DIR.toString());
-      } else {
-        this.mpiAppDir = envs.get(ApplicationConstants.Environment.PWD.name());
-      }
-      LOG.info(xlearningAppType.toLowerCase() + " app dir is:" + this.mpiAppDir);
-      LOG.info(xlearningAppType.toLowerCase() + " container index is: " + this.index);
-    }
-
-    containerType = conf.get(XLearningConfiguration.XLEARNING_CONTAINER_TYPE,
-        XLearningConfiguration.DEFAULT_XLEARNING_CONTAINER_TYPE);
-    LOG.info("containerType:" + containerType);
-    if (containerType.equalsIgnoreCase("DOCKER")) {
-      containerLaunch = new DockerContainer(containerId, conf);
-      Runtime.getRuntime().addShutdownHook(new Thread(new Runnable() {
-        @Override
-        public void run() {
-          try {
-            String containerIdStr = containerId.getContainerId().toString();
-            Runtime rt = Runtime.getRuntime();
-            String dockerPullCommand = "docker kill " + containerIdStr;
-            LOG.info("Docker kill command:" + dockerPullCommand);
-            Process process = rt.exec(dockerPullCommand);
-            int i = process.waitFor();
-            LOG.info("Docker Kill Wait:" + (i == 0 ? "Success" : "Failed"));
-            BufferedReader br = new BufferedReader(new InputStreamReader(process.getInputStream()));
-            String line;
-            while ((line = br.readLine()) != null) {
-              LOG.info(line);
-            }
-          } catch (Exception e) {
-            LOG.warn("Docker Kill Error:", e);
-          }
-        }
-      }));
-    } else {
-      containerLaunch = new YarnContainer(containerId);
-    }
-
     this.single = conf.getBoolean(XLearningConfiguration.XLEARNING_MODE_SINGLE, XLearningConfiguration.DEFAULT_XLEARNING_MODE_SINGLE);
     heartbeatInterval = this.conf.getInt(XLearningConfiguration.XLEARNING_CONTAINER_HEARTBEAT_INTERVAL, XLearningConfiguration.DEFAULT_XLEARNING_CONTAINER_HEARTBEAT_INTERVAL);
     this.reservePortBegin = this.conf.getInt(XLearningConfiguration.XLEARNING_RESERVE_PORT_BEGIN,
@@ -229,11 +198,9 @@ public class XLearningContainer {
 
     containerReporter = null;
 
-    if ((("TENSORFLOW".equals(xlearningAppType) || "LIGHTLDA".equals(xlearningAppType)) && !single) || xlearningAppType.equals("DISTLIGHTGBM") || containerLaunch instanceof DockerContainer) {
+    if ((("TENSORFLOW".equals(xlearningAppType) || "LIGHTLDA".equals(xlearningAppType)) && !single) || xlearningAppType.equals("DISTLIGHTGBM")) {
       try {
         Utilities.getReservePort(reservedSocket, InetAddress.getByName(localHost).getHostAddress(), reservePortBegin, reservePortEnd);
-        conf.set("RESERVED_PORT", reservedSocket.getLocalPort() + "");
-        LOG.error(conf.get("RESERVED_PORT"));
       } catch (IOException e) {
         LOG.error("Can not get available port");
         reportFailedAndExit();
@@ -1160,16 +1127,23 @@ public class XLearningContainer {
   }
 
   public static void main(String[] args) {
-    XLearningContainer container = new XLearningContainer();
+    final XLearningContainer container = new XLearningContainer();
     try {
-      container.init();
-      if (container.run()) {
-        LOG.info("XLearningContainer " + container.getContainerId().toString() + " finish successfully");
-        container.reportSucceededAndExit();
-      } else {
-        LOG.error("XLearningContainer run failed!");
-        container.reportFailedAndExit();
-      }
+      UserGroupInformation ugi = SecurityUtil.setupUserGroupInformation();
+      ugi.doAs(new PrivilegedExceptionAction<Void>() {
+        @Override
+        public Void run() throws Exception {
+          container.init();
+          if (container.run()) {
+            LOG.info("XLearningContainer " + container.getContainerId().toString() + " finish successfully");
+            container.reportSucceededAndExit();
+          } else {
+            LOG.error("XLearningContainer run failed!");
+            container.reportFailedAndExit();
+          }
+          return null;
+        }
+      });
     } catch (Exception e) {
       LOG.error("Some errors has occurred during container running!", e);
       container.reportFailedAndExit();
